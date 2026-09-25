@@ -47,3 +47,9 @@ watchlist:
     origins: [LHR]
     trip: return
     stay_nights: 10
+
+  - name: Newcastle to Dubai
+    destination: DXB
+    origins: [NCL, MAN, LHR]
+    trip: return
+    stay_nights: 7
