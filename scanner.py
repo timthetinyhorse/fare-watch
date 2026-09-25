@@ -120,12 +120,28 @@ def search(token, job, settings):
                       timeout=60)
     if r.status_code == 429:
         raise RateLimited()
-    r.raise_for_status()
+    if r.status_code in (401, 403):
+        raise AccessDenied(r.status_code, duffel_message(r))
+    if not r.ok:
+        raise RuntimeError(f"{r.status_code}: {duffel_message(r)}")
     return r.json()["data"].get("offers", [])
 
 
 class RateLimited(Exception):
     pass
+
+
+class AccessDenied(Exception):
+    pass
+
+
+def duffel_message(r):
+    """Pull Duffel's own explanation out of an error response."""
+    try:
+        e = r.json()["errors"][0]
+        return f"{e.get('title', '')} - {e.get('message', '')} (code: {e.get('code', '?')})"
+    except Exception:
+        return r.text[:300]
 
 
 def parse_offer(offer):
@@ -220,6 +236,12 @@ def main():
                 total_offers += len(offers)
                 print(f"{label}: {len(offers)} offers")
                 break
+            except AccessDenied as e:
+                print(f"{label}: Duffel refused access ({e.args[0]}).")
+                print(f"Duffel says: {e.args[1]}")
+                print("Stopping: every search would fail the same way. "
+                      "See the README section 'If Duffel refuses access'.")
+                sys.exit(1)
             except RateLimited:
                 print(f"{label}: rate limited, waiting 60s")
                 time.sleep(60)
