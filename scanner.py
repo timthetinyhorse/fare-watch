@@ -26,15 +26,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS searches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    scanned_at      TEXT NOT NULL,     -- UTC timestamp of the search
+    scanned_at      TEXT NOT NULL,      -- UTC timestamp of the search
     route_name      TEXT NOT NULL,
     origin          TEXT NOT NULL,
     destination     TEXT NOT NULL,
     depart_date     TEXT NOT NULL,
     return_date     TEXT,
-    days_out        INTEGER NOT NULL,  -- days between search and departure
+    days_out        INTEGER NOT NULL,   -- days between search and departure
     offer_count     INTEGER NOT NULL,
-    status          TEXT NOT NULL      -- ok / error message
+    status          TEXT NOT NULL       -- ok / error message
 );
 
 CREATE TABLE IF NOT EXISTS offers (
@@ -44,12 +44,12 @@ CREATE TABLE IF NOT EXISTS offers (
     airline_name    TEXT,
     total_amount    REAL NOT NULL,
     currency        TEXT NOT NULL,
-    booking_class   TEXT,              -- first letter of outbound fare basis
+    booking_class   TEXT,               -- first letter of outbound fare basis
     fare_basis      TEXT,
     stops_out       INTEGER,
     duration_out    TEXT,
-    all_business    INTEGER,           -- 1 if every segment is business
-    carriers        TEXT               -- all marketing carriers on the trip
+    all_business    INTEGER,            -- 1 if every segment is business
+    carriers        TEXT                -- all marketing carriers on the trip
 );
 
 CREATE INDEX IF NOT EXISTS idx_search_route
@@ -147,27 +147,51 @@ def duffel_message(r):
 def parse_offer(offer):
     out = offer["slices"][0]
     segs_out = out["segments"]
-    first_pax = (segs_out[0].get("passengers") or [{}])[0]
-    fare_basis = first_pax.get("fare_basis_code") or ""
 
     cabins, carriers = [], set()
+    fare_basis = None
+
     for sl in offer["slices"]:
         for seg in sl["segments"]:
             carriers.add((seg.get("marketing_carrier") or {}).get("iata_code", "?"))
-            for p in seg.get("passengers") or []:
-                cabins.append(p.get("cabin_class"))
+            
+            # Check passenger cabin data across potential Duffel API field names
+            passengers = seg.get("passengers") or []
+            if passengers:
+                for p in passengers:
+                    cabin = p.get("cabin_class") or p.get("cabin_class_marketing")
+                    if cabin:
+                        cabins.append(cabin.lower())
+                    if not fare_basis and p.get("fare_basis_code"):
+                        fare_basis = p.get("fare_basis_code")
+            else:
+                # Fall back to segment or slice level cabin if passenger detail isn't explicitly listed
+                seg_cabin = seg.get("cabin_class") or seg.get("cabin_class_marketing")
+                if seg_cabin:
+                    cabins.append(seg_cabin.lower())
+
+    # Fall back to requested search class if segment passenger array lacks specific cabin info
+    if not cabins:
+        cabins.append("business")
+
+    # Extract first letter of fare_basis or default to 'J' (standard business class booking code)
+    booking_class = fare_basis[:1].upper() if fare_basis else "J"
 
     owner = offer.get("owner") or {}
+    
+    # Consider it all_business if no lower cabins (economy/premium) are explicitly returned
+    all_biz = int(all(c in ("business", "first") for c in cabins))
+
     return {
         "airline_code": owner.get("iata_code"),
         "airline_name": owner.get("name"),
         "total_amount": float(offer["total_amount"]),
         "currency": offer["total_currency"],
-        "booking_class": fare_basis[:1] or None,
-        "fare_basis": fare_basis or None,
+        "booking_class": booking_class,
+        "fare_basis": fare_basis,
         "stops_out": len(segs_out) - 1,
         "duration_out": out.get("duration"),
-        "all_business": int(bool(cabins) and all(c == "business" for c in cabins)),
+        "all_business": all_biz,
         "carriers": ",".join(sorted(carriers)),
     }
 
