@@ -1,0 +1,49 @@
+# Fare Watch configuration
+# Edit the watchlist to the trips you actually take. Each search costs API
+# quota and time, so start small and add routes once it's running smoothly.
+
+settings:
+  cabin_class: business
+  adults: 1
+  max_connections: 1          # 0 = direct only
+  # How far ahead to look, and how often to sample departure dates.
+  # 14-330 days, every 14 days = ~23 departure dates per origin per run.
+  # The starting offset rotates each day, so over a fortnight of daily runs
+  # every departure date (and every day of the week) gets checked.
+  days_ahead_min: 14
+  days_ahead_max: 330
+  sample_every_n_days: 14
+  # Safety cap so a mistake in the watchlist can't burn through quota.
+  max_searches_per_run: 150
+  # Duffel allows 60 requests a minute; this keeps us comfortably under.
+  seconds_between_searches: 1.2
+  database: fares.db
+
+# Approximate FX rates for comparing fares quoted in different currencies.
+# Update occasionally; they only affect cross-currency comparisons.
+fx_to_gbp:
+  GBP: 1.0
+  EUR: 0.85
+  USD: 0.76
+  NOK: 0.071
+  SEK: 0.070
+
+watchlist:
+  - name: London to New York
+    destination: JFK
+    # Search from home and from "ex-EU" starting points to compare.
+    origins: [LHR, DUB, OSL]
+    trip: return
+    stay_nights: 7
+
+  - name: London to Dubai
+    destination: DXB
+    origins: [LHR, NCL]
+    trip: return
+    stay_nights: 5
+
+  - name: London to Singapore
+    destination: SIN
+    origins: [LHR]
+    trip: return
+    stay_nights: 10
