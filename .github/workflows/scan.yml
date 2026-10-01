@@ -1,40 +1,44 @@
-name: Daily fare scan
+name: Daily Fare Watch Scan
 
 on:
   schedule:
-    - cron: "0 5 * * *"   # every day at 05:00 UTC (6am UK summer time)
-  workflow_dispatch:       # adds a "Run workflow" button for manual runs
-
-permissions:
-  contents: write
+    - cron: '0 6 * * *'
+  workflow_dispatch:
 
 jobs:
   scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: '3.11'
 
-      - name: Install libraries
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duffel-api pyyaml pandas streamlit plotly
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Scan fares
+      - name: Run Fare Scanner
         env:
-          DUFFEL_TOKEN: ${{ secrets.DUFFEL_TOKEN }}
-        run: python scanner.py
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+        run: |
+          python scanner.py
 
-      - name: Build report
-        # Early on there may not be enough data for a report; don't fail the run.
-        run: python analyse.py --out docs/index.html || echo "Report skipped"
+      - name: Run Analysis Report
+        run: |
+          python analyse.py --out docs/index.html || echo "Report skipped"
 
-      - name: Save history and report
+      - name: Commit and Push Changes
         run: |
           git config user.name "fare-watch-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add -A
-          git commit -m "Daily scan $(date -u +%F)" || echo "Nothing new to save"
+          git config user.email "bot@farewatch.local"
+          git add .
+          git commit -m "Daily scan $(date -u +'%Y-%m-%d')" || exit 0
+          git pull --rebase origin main
           git push
