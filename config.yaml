@@ -1,61 +1,26 @@
-# Fare Watch configuration
-# Edit the watchlist to the trips you actually take. Each search costs API
-# quota and time, so start small and add routes once it's running smoothly.
-
 settings:
-  cabin_class: business
-  adults: 1
-  max_connections: 1          # 0 = direct only
-  # How far ahead to look, and how often to sample departure dates.
-  # 14-330 days, every 14 days = ~23 departure dates per origin per run.
-  # The starting offset rotates each day, so over a fortnight of daily runs
-  # every departure date (and every day of the week) gets checked.
-  days_ahead_min: 14
-  days_ahead_max: 330
-  sample_every_n_days: 14
-  # Safety cap so a mistake in the watchlist can't burn through quota.
-  max_searches_per_run: 150
-  # Duffel allows 60 requests a minute; this keeps us comfortably under.
-  seconds_between_searches: 1.2
-  database: fares.db
+  database: "farewatch.db"
+  cabins:
+    - "business"
+  passengers: 1
+  trip_type: "return"
+  return_stay_days: 14
+  max_connections: 1
+  
+  # Scan window constraints for Summer
+  search_months:
+    - "2027-07"
+    - "2027-08"
 
-# Approximate FX rates for comparing fares quoted in different currencies.
-# Update occasionally; they only affect cross-currency comparisons.
 fx_to_gbp:
   GBP: 1.0
+  USD: 0.78
   EUR: 0.85
-  USD: 0.76
-  NOK: 0.071
-  SEK: 0.070
+  AED: 0.21
 
-watchlist:
-  - name: Newcastle to New York
-    destination: JFK
-    # Search from home and from "ex-EU" starting points to compare.
-    origins: [NCL, LHR, DUB, OSL]
-    trip: return
-    stay_nights: 7
-
-  - name: Newcastle to Dubai
-    destination: DXB
-    origins: [LHR, NCL]
-    trip: return
-    stay_nights: 5
-
-  - name: Newcastle to Los Angeles
-    destination: LAX
-    origins: [NCL, LHR]
-    trip: return
-    stay_nights: 10
-
-  - name: Newcastle to Dubai
-    destination: DXB
-    origins: [NCL, MAN, LHR]
-    trip: return
-    stay_nights: 7
-
-    name: Newcastle to San Francisco
-    destination: SFO
-    origins: [NCL, MAN, LHR]
-    trip: return
-    stay_nights: 7
+routes:
+  - name: "Newcastle to San Francisco / Los Angeles to Newcastle"
+    origin: "NCL"
+    destination: "SFO"
+    return_origin: "LAX"
+    return_destination: "NCL"
