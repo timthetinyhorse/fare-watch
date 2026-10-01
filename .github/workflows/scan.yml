@@ -2,43 +2,43 @@ name: Daily Fare Watch Scan
 
 on:
   schedule:
+    # Runs daily at 06:00 UTC
     - cron: '0 6 * * *'
+  # Allows manually triggering the workflow from the GitHub Actions tab
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  scan:
-    runs-on: ubuntu-24.04
+  scan-and-publish:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install duffel-api pyyaml pandas streamlit plotly
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests pandas jinja2 matplotlib; fi
 
-      - name: Run Fare Scanner
+      - name: Run Fare Scanner and Generator
         env:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
         run: |
           python scanner.py
+          python analyse.py --out docs/index.html
 
-      - name: Run Analysis Report
-        run: |
-          python analyse.py --out docs/index.html || echo "Report skipped"
-
-      - name: Commit and Push Changes
+      - name: Commit and Push Updated Results
         run: |
           git config user.name "fare-watch-bot"
-          git config user.email "bot@farewatch.local"
-          git add .
-          git commit -m "Daily scan $(date -u +'%Y-%m-%d')" || exit 0
-          git pull --rebase origin main
-          git push
+          git config user.email "actions@github.com"
+          git add fares.db docs/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Daily fare scan and report update [skip ci]" && git push)
