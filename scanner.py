@@ -1,3 +1,4 @@
+
 import os
 import sqlite3
 import time
@@ -66,7 +67,6 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
         "Content-Type": "application/json",
     }
 
-    # Open-jaw payload: NCL -> SFO and LAX -> NCL
     payload = {
         "data": {
             "slices": [
@@ -80,6 +80,7 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -92,21 +93,21 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
 
             cursor.execute(
                 """
-                INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-                (route_name, origin, outbound_dest, depart_date, 14, "error"),
+                (now_str, route_name, origin, outbound_dest, depart_date, 14, "error"),
             )
             conn.commit()
             return
 
-        # Insert search log entry
+        # Insert search log entry with explicit scanned_at timestamp
         cursor.execute(
             """
-            INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-            (route_name, origin, outbound_dest, depart_date, 14, "ok"),
+            (now_str, route_name, origin, outbound_dest, depart_date, 14, "ok"),
         )
         search_id = cursor.lastrowid
 
