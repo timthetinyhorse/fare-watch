@@ -1,274 +1,169 @@
-
-import datetime
 import os
 import sqlite3
-import sys
 import time
-from duffel_api import Duffel
-import yaml
+from datetime import datetime, timedelta
+import requests
 
-# --- Load Configuration ---
-CONFIG_FILE = "config.yaml"
-if not os.path.exists(CONFIG_FILE):
-    print(f"Error: Configuration file '{CONFIG_FILE}' not found.")
-    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Configuration & Database Setup
+# ---------------------------------------------------------------------------
+DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY", "duffel_test_YOUR_API_KEY")
+DB_PATH = "farewatch.db"
 
-with open(CONFIG_FILE, "r") as f:
-    config = yaml.safe_load(f)
 
-# Initialize Duffel API Client
-api_key = os.getenv("DUFFEL_API_KEY")
-if not api_key:
-    print("Error: DUFFEL_API_KEY environment variable is not set.")
-    sys.exit(1)
+def init_db():
+    """Ensure database schema includes all required fields."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-duffel = Duffel(access_token=api_key)
-
-# --- Database Setup ---
-db_path = config["settings"].get("database", "farewatch.db")
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-
-# Core Tables
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS routes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE,
-    origin TEXT,
-    destination TEXT,
-    return_origin TEXT,
-    return_destination TEXT
-)
-"""
-)
-
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS scans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-"""
-)
-
-# Legacy compatibility table required by analyse.py
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS searches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    route_name TEXT,
-    origin TEXT,
-    destination TEXT,
-    depart_date TEXT,
-    days_out INTEGER,
-    status TEXT DEFAULT 'ok'
-)
-"""
-)
-
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS offers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scan_id INTEGER,
-    search_id INTEGER,
-    route_id INTEGER,
-    airline TEXT,
-    airline_code TEXT,
-    airline_name TEXT,
-    total_amount REAL,
-    currency TEXT,
-    total_amount_gbp REAL,
-    outbound_date TEXT,
-    return_date TEXT,
-    transfers INTEGER,
-    booking_class TEXT DEFAULT 'business',
-    stops_out INTEGER DEFAULT 0,
-    all_business INTEGER DEFAULT 1,
-    FOREIGN KEY(scan_id) REFERENCES scans(id),
-    FOREIGN KEY(route_id) REFERENCES routes(id)
-)
-"""
-)
-
-# Unified View
-cursor.execute(
-    """
-CREATE VIEW IF NOT EXISTS v_full_fare_history AS
-SELECT 
-    scans.created_at AS scan_timestamp,
-    routes.name AS route_name,
-    routes.origin,
-    routes.destination,
-    routes.return_origin,
-    routes.return_destination,
-    offers.airline,
-    offers.total_amount_gbp AS price_gbp,
-    offers.outbound_date,
-    offers.return_date,
-    offers.transfers
-FROM offers
-JOIN scans ON offers.scan_id = scans.id
-JOIN routes ON offers.route_id = routes.id
-ORDER BY scans.created_at DESC;
-"""
-)
-conn.commit()
-
-# Record current scan session
-cursor.execute("INSERT INTO scans DEFAULT VALUES")
-scan_id = cursor.lastrowid
-conn.commit()
-
-# --- Date Range Generator (July & August 2027) ---
-search_months = config["settings"].get("search_months", ["2027-07", "2027-08"])
-departure_dates = []
-
-for month_str in search_months:
-    year, month = map(int, month_str.split("-"))
-    start_day = 1
-    today = datetime.date.today()
-    if year == today.year and month == today.month:
-        start_day = today.day + 1
-
-    if month == 12:
-        next_month = datetime.date(year + 1, 1, 1)
-    else:
-        next_month = datetime.date(year, month + 1, 1)
-    last_day = (next_month - datetime.timedelta(days=1)).day
-
-    for day in range(
-        start_day, last_day + 1, 2
-    ):  # Scan every 2 days for API rate optimization
-        departure_dates.append(datetime.date(year, month, day))
-
-stay_days = config["settings"].get("return_stay_days", 14)
-max_connections = config["settings"].get("max_connections", 1)
-fx_rates = config.get("fx_to_gbp", {"GBP": 1.0, "USD": 0.78, "EUR": 0.85})
-
-print(
-    f"Starting Scan ID {scan_id} for {len(departure_dates)} target departure windows..."
-)
-
-for route in config["routes"]:
     cursor.execute(
         """
-        INSERT INTO routes (name, origin, destination, return_origin, return_destination)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET
-            origin=excluded.origin,
-            destination=excluded.destination,
-            return_origin=excluded.return_origin,
-            return_destination=excluded.return_destination
-    """,
-        (
-            route["name"],
-            route["origin"],
-            route["destination"],
-            route.get("return_origin", route["destination"]),
-            route.get("return_destination", route["origin"]),
-        ),
+        CREATE TABLE IF NOT EXISTS searches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            route_name TEXT,
+            origin TEXT,
+            destination TEXT,
+            depart_date TEXT,
+            days_out INTEGER,
+            status TEXT
+        )
+    """
     )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_id INTEGER,
+            airline_code TEXT,
+            airline_name TEXT,
+            total_amount REAL,
+            currency TEXT,
+            booking_class TEXT,
+            stops_out INTEGER,
+            all_business INTEGER,
+            FOREIGN KEY (search_id) REFERENCES searches(id)
+        )
+    """
+    )
+
     conn.commit()
+    conn.close()
 
-    cursor.execute("SELECT id FROM routes WHERE name = ?", (route["name"],))
-    route_id = cursor.fetchone()[0]
 
-    ret_origin = route.get("return_origin", route["destination"])
-    ret_dest = route.get("return_destination", route["origin"])
+# ---------------------------------------------------------------------------
+# Duffel API Scanner (Business Class)
+# ---------------------------------------------------------------------------
+def scan_window(origin, destination, depart_date, return_date, route_name="NCL-US"):
+    """Queries Duffel for Business Class flight offers using the active v2 API version."""
+    url = "https://api.duffel.com/air/offer_requests"
 
-    for dep_date in departure_dates:
-        ret_date = dep_date + datetime.timedelta(days=stay_days)
-        dep_str = dep_date.strftime("%Y-%m-%d")
-        ret_str = ret_date.strftime("%Y-%m-%d")
+    headers = {
+        "Authorization": f"Bearer {DUFFEL_API_KEY}",
+        "Duffel-Version": "v2",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-        print(f"Searching {route['name']}: {dep_str} to {ret_str}...")
+    payload = {
+        "data": {
+            "slices": [
+                {"origin": origin, "destination": destination, "departure_date": depart_date},
+                {"origin": "LAX", "destination": origin, "departure_date": return_date},
+            ],
+            "passengers": [{"type": "adult"}],
+            "cabin_class": "business",  # UPDATE 1: Set cabin search to Business Class
+        }
+    }
 
-        # Create entry in legacy searches table for analyse.py compatibility
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        data = response.json()
+
+        if response.status_code != 200 and response.status_code != 201:
+            error_type = data.get("errors", [{}])[0].get("type", "unknown_error")
+            error_msg = data.get("errors", [{}])[0].get("message", "Request failed")
+            print(f"Error scanning {depart_date}: {error_type}: {error_msg}")
+
+            cursor.execute(
+                """
+                INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (route_name, origin, destination, depart_date, 14, "error"),
+            )
+            conn.commit()
+            return
+
+        # Insert search log entry
         cursor.execute(
             """
             INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
-            VALUES (?, ?, ?, ?, ?, 'ok')
+            VALUES (?, ?, ?, ?, ?, ?)
         """,
-            (route["name"], route["origin"], route["destination"], dep_str, 0),
+            (route_name, origin, destination, depart_date, 14, "ok"),
         )
         search_id = cursor.lastrowid
 
-        try:
-            # Send Open-Jaw Business Class Request to Duffel API
-            # NOTE: Using plural 'passengers' fixes the 'OfferRequestCreate' error
-            offer_request = (
-                duffel.offer_requests.create()
-                .passengers([{"type": "adult"}])
-                .cabin_class("business")
-                .slices(
-                    [
-                        {
-                            "origin": route["origin"],
-                            "destination": route["destination"],
-                            "departure_date": dep_str,
-                        },
-                        {
-                            "origin": ret_origin,
-                            "destination": ret_dest,
-                            "departure_date": ret_str,
-                        },
-                    ]
-                )
-                .execute()
+        # Parse and save flight offers
+        offers = data.get("data", {}).get("offers", [])
+        for offer in offers:
+            owner = offer.get("owner", {})
+            airline_code = owner.get("iata_code", "XX")
+            airline_name = owner.get("name", "Unknown Airline")
+            total_amount = float(offer.get("total_amount", 0.0))
+            currency = offer.get("total_currency", "GBP")
+
+            # Count total stops on outward leg
+            outbound_slices = offer.get("slices", [])[0] if offer.get("slices") else {}
+            segments = outbound_slices.get("segments", [])
+            stops_out = max(0, len(segments) - 1)
+
+            cursor.execute(
+                """
+                INSERT INTO offers (
+                    search_id, airline_code, airline_name, total_amount, currency,
+                    booking_class, stops_out, all_business
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    search_id,
+                    airline_code,
+                    airline_name,
+                    total_amount,
+                    currency,
+                    "business",  # UPDATE 2: Store booking class as business
+                    stops_out,
+                    1,           # UPDATE 3: Flag all_business as 1 (True)
+                ),
             )
 
-            offers = duffel.offers.list(offer_request.id)
+        conn.commit()
+        print(f"Successfully scanned {depart_date}: Found {len(offers)} Business class offers")
 
-            for offer in offers:
-                max_transfers = 0
-                for s in offer.slices:
-                    num_segments = len(s.segments)
-                    transfers = num_segments - 1
-                    if transfers > max_transfers:
-                        max_transfers = transfers
+    except Exception as e:
+        print(f"Error scanning {depart_date}: {e}")
+    finally:
+        conn.close()
 
-                if max_transfers > max_connections:
-                    continue
 
-                amount = float(offer.total_amount)
-                currency = offer.total_currency
-                gbp_rate = fx_rates.get(currency, 1.0)
-                amount_gbp = round(amount * gbp_rate, 2)
-                airline_name = offer.owner.name
-                airline_code = getattr(offer.owner, "iata_code", "XX")
+# ---------------------------------------------------------------------------
+# Main Execution Entry
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    init_db()
+    print("Starting Business Class Scan...")
 
-                cursor.execute(
-                    """
-                    INSERT INTO offers 
-                    (scan_id, search_id, route_id, airline, airline_code, airline_name, 
-                     total_amount, currency, total_amount_gbp, outbound_date, return_date, transfers, booking_class)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'business')
-                """,
-                    (
-                        scan_id,
-                        search_id,
-                        route_id,
-                        airline_name,
-                        airline_code,
-                        airline_name,
-                        amount,
-                        currency,
-                        amount_gbp,
-                        dep_str,
-                        ret_str,
-                        max_transfers,
-                    ),
-                )
+    start_date = datetime.strptime("2027-07-01", "%Y-%m-%d")
+    for i in range(5):  # Adjust range for desired number of windows
+        dep = (start_date + timedelta(days=i * 2)).strftime("%Y-%m-%d")
+        ret = (start_date + timedelta(days=i * 2 + 14)).strftime("%Y-%m-%d")
+        print(f"Searching Newcastle to San Francisco / Los Angeles to Newcastle (Business): {dep} to {ret}...")
+        scan_window("NCL", "SFO", dep, ret)
+        time.sleep(1)
 
-            conn.commit()
-            time.sleep(0.5)
-
-        except Exception as e:
-            print(f"Error scanning {dep_str}: {str(e)}")
-            continue
-
-conn.close()
-print("Scan completed successfully. Results logged to farewatch.db.")
+    print("Business class scan completed successfully. Results logged to farewatch.db.")
