@@ -53,9 +53,14 @@ def init_db():
 
 
 def fetch_one_way_leg(
-    origin, destination, depart_date, leg_type="outbound", top_limit=50
+    origin,
+    destination,
+    depart_date,
+    leg_type="outbound",
+    top_limit=50,
+    max_retries=5,
 ):
-    """Fetch one-way offers from Duffel API and store in SQLite."""
+    """Fetch one-way offers from Duffel API with rate-limit retry logic."""
     url = "https://api.duffel.com/air/offer_requests"
     headers = {
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
@@ -78,77 +83,103 @@ def fetch_one_way_leg(
         }
     }
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    retry_count = 0
+    backoff = 2  # start wait time in seconds
 
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        data = response.json()
-
-        if response.status_code not in (200, 201):
-            print(
-                f"Error scanning {leg_type} {origin}->{destination} on {depart_date}: {data.get('errors')}"
+    while retry_count <= max_retries:
+        try:
+            response = requests.post(
+                url, json=payload, headers=headers, timeout=30
             )
-            return
 
-        offers = data.get("data", {}).get("offers", [])
-        sorted_offers = sorted(
-            offers, key=lambda x: float(x.get("total_amount", float("inf")))
-        )[:top_limit]
+            # Handle Duffel Rate Limits (429)
+            if response.status_code == 429:
+                # Read ratelimit-reset header or wait backoff
+                reset_delay = response.headers.get("ratelimit-reset", backoff)
+                try:
+                    wait_time = float(reset_delay) + 0.5
+                except ValueError:
+                    wait_time = backoff
 
-        cursor.execute(
-            """
-            INSERT INTO searches (scanned_at, leg_type, origin, destination, depart_date, status, offer_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                now_str,
-                leg_type,
-                origin,
-                destination,
-                depart_date,
-                "ok",
-                len(sorted_offers),
-            ),
-        )
-        search_id = cursor.lastrowid
+                print(
+                    f"Rate limited on {leg_type} {origin}->{destination} ({depart_date}). Waiting {wait_time:.1f}s before retry..."
+                )
+                time.sleep(wait_time)
+                retry_count += 1
+                backoff *= 2  # Exponential backoff
+                continue
 
-        for offer in sorted_offers:
-            owner = offer.get("owner", {})
-            airline_code = owner.get("iata_code", "XX")
-            airline_name = owner.get("name", "Unknown Airline")
-            total_amount = float(offer.get("total_amount", 0.0))
-            currency = offer.get("total_currency", "GBP")
+            data = response.json()
 
-            slices = offer.get("slices", [])
-            segments = slices[0].get("segments", []) if slices else []
-            stops = max(0, len(segments) - 1)
+            if response.status_code not in (200, 201):
+                print(
+                    f"Error scanning {leg_type} {origin}->{destination} on {depart_date}: {data.get('errors')}"
+                )
+                return
+
+            offers = data.get("data", {}).get("offers", [])
+            sorted_offers = sorted(
+                offers, key=lambda x: float(x.get("total_amount", float("inf")))
+            )[:top_limit]
+
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
             cursor.execute(
                 """
-                INSERT INTO offers (search_id, airline_code, airline_name, total_amount, currency, stops)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO searches (scanned_at, leg_type, origin, destination, depart_date, status, offer_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
                 (
-                    search_id,
-                    airline_code,
-                    airline_name,
-                    total_amount,
-                    currency,
-                    stops,
+                    now_str,
+                    leg_type,
+                    origin,
+                    destination,
+                    depart_date,
+                    "ok",
+                    len(sorted_offers),
                 ),
             )
+            search_id = cursor.lastrowid
 
-        conn.commit()
-        print(
-            f"Saved {len(sorted_offers)} offers for {leg_type.upper()} {origin}->{destination} ({depart_date})"
-        )
+            for offer in sorted_offers:
+                owner = offer.get("owner", {})
+                airline_code = owner.get("iata_code", "XX")
+                airline_name = owner.get("name", "Unknown Airline")
+                total_amount = float(offer.get("total_amount", 0.0))
+                currency = offer.get("total_currency", "GBP")
 
-    except Exception as e:
-        print(f"Exception during {origin}->{destination}: {e}")
-    finally:
-        conn.close()
+                slices = offer.get("slices", [])
+                segments = slices[0].get("segments", []) if slices else []
+                stops = max(0, len(segments) - 1)
+
+                cursor.execute(
+                    """
+                    INSERT INTO offers (search_id, airline_code, airline_name, total_amount, currency, stops)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        search_id,
+                        airline_code,
+                        airline_name,
+                        total_amount,
+                        currency,
+                        stops,
+                    ),
+                )
+
+            conn.commit()
+            conn.close()
+
+            print(
+                f"Saved {len(sorted_offers)} offers for {leg_type.upper()} {origin}->{destination} ({depart_date})"
+            )
+            return  # Success, exit function
+
+        except Exception as e:
+            print(f"Exception during {origin}->{destination}: {e}")
+            return
 
 
 def generate_html_report():
@@ -157,7 +188,6 @@ def generate_html_report():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Match outbound + return legs by airline to build total trip price
     cursor.execute(
         """
         SELECT 
@@ -238,7 +268,9 @@ def generate_html_report():
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    print(f"Successfully generated {OUTPUT_HTML}")
+    print(
+        f"Successfully generated {OUTPUT_HTML} with {len(rows)} combined deals."
+    )
 
 
 if __name__ == "__main__":
@@ -253,15 +285,15 @@ if __name__ == "__main__":
         outbound_date = current_dep.strftime("%Y-%m-%d")
         return_date = (current_dep + timedelta(days=14)).strftime("%Y-%m-%d")
 
-        # Fetch individual legs
         fetch_one_way_leg(
             "NCL", "SFO", outbound_date, leg_type="outbound", top_limit=50
         )
-        time.sleep(0.3)
+        time.sleep(1.2)  # Generous gap between requests to prevent hitting 429
+
         fetch_one_way_leg(
             "LAX", "NCL", return_date, leg_type="return", top_limit=50
         )
-        time.sleep(0.3)
+        time.sleep(1.2)
 
         current_dep += timedelta(days=3)
 
