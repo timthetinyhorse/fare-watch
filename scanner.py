@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import time
@@ -6,10 +7,14 @@ import requests
 
 DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY", "duffel_test_YOUR_API_KEY")
 DB_PATH = "fares.db"
+OUTPUT_HTML = "docs/index.html"
 
 
 def init_db():
-    """Setup database schema to support individual leg tracking and paired routes."""
+    """Reset and create database schema for individual leg tracking."""
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -18,7 +23,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS searches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            leg_type TEXT,          -- 'outbound' or 'return'
+            leg_type TEXT,
             origin TEXT,
             destination TEXT,
             depart_date TEXT,
@@ -37,7 +42,6 @@ def init_db():
             airline_name TEXT,
             total_amount REAL,
             currency TEXT,
-            booking_class TEXT,
             stops INTEGER,
             FOREIGN KEY (search_id) REFERENCES searches(id)
         )
@@ -49,11 +53,10 @@ def init_db():
 
 
 def fetch_one_way_leg(
-    origin, destination, depart_date, leg_type="outbound", top_limit=100
+    origin, destination, depart_date, leg_type="outbound", top_limit=50
 ):
-    """Executes a single one-way flight search on Duffel."""
+    """Fetch one-way offers from Duffel API and store in SQLite."""
     url = "https://api.duffel.com/air/offer_requests"
-
     headers = {
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Duffel-Version": "v2",
@@ -84,28 +87,12 @@ def fetch_one_way_leg(
         data = response.json()
 
         if response.status_code not in (200, 201):
-            print(f"Error scanning {origin}->{destination} on {depart_date}")
-            cursor.execute(
-                """
-                INSERT INTO searches (scanned_at, leg_type, origin, destination, depart_date, status, offer_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    now_str,
-                    leg_type,
-                    origin,
-                    destination,
-                    depart_date,
-                    "error",
-                    0,
-                ),
+            print(
+                f"Error scanning {leg_type} {origin}->{destination} on {depart_date}: {data.get('errors')}"
             )
-            conn.commit()
             return
 
         offers = data.get("data", {}).get("offers", [])
-
-        # Sort by lowest total fare and limit
         sorted_offers = sorted(
             offers, key=lambda x: float(x.get("total_amount", float("inf")))
         )[:top_limit]
@@ -140,10 +127,8 @@ def fetch_one_way_leg(
 
             cursor.execute(
                 """
-                INSERT INTO offers (
-                    search_id, airline_code, airline_name, total_amount, currency,
-                    booking_class, stops
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO offers (search_id, airline_code, airline_name, total_amount, currency, stops)
+                VALUES (?, ?, ?, ?, ?, ?)
             """,
                 (
                     search_id,
@@ -151,14 +136,13 @@ def fetch_one_way_leg(
                     airline_name,
                     total_amount,
                     currency,
-                    "business",
                     stops,
                 ),
             )
 
         conn.commit()
         print(
-            f"Scanned {leg_type.upper()} {origin}->{destination} ({depart_date}): Saved top {len(sorted_offers)} offers"
+            f"Saved {len(sorted_offers)} offers for {leg_type.upper()} {origin}->{destination} ({depart_date})"
         )
 
     except Exception as e:
@@ -167,9 +151,99 @@ def fetch_one_way_leg(
         conn.close()
 
 
+def generate_html_report():
+    """Query paired legs from SQLite and build docs/index.html."""
+    os.makedirs("docs", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Match outbound + return legs by airline to build total trip price
+    cursor.execute(
+        """
+        SELECT 
+            s_out.depart_date AS outbound_date,
+            s_in.depart_date AS return_date,
+            o_out.airline_name,
+            o_out.airline_code,
+            ROUND(o_out.total_amount + o_in.total_amount, 2) AS total_price,
+            o_out.currency,
+            o_out.stops AS out_stops,
+            o_in.stops AS in_stops
+        FROM offers o_out
+        JOIN searches s_out ON o_out.search_id = s_out.id AND s_out.leg_type = 'outbound'
+        JOIN searches s_in ON s_in.leg_type = 'return' 
+            AND s_in.depart_date = DATE(s_out.depart_date, '+14 days')
+        JOIN offers o_in ON o_in.search_id = s_in.id 
+            AND o_in.airline_code = o_out.airline_code
+        ORDER BY total_price ASC
+        LIMIT 250
+    """
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fare Watch - Business Class Scan</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background: #f4f6f8; color: #333; }}
+        h1 {{ color: #111; }}
+        .meta {{ margin-bottom: 20px; color: #666; font-size: 0.9em; }}
+        table {{ width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden; }}
+        th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #eee; }}
+        th {{ background: #0066cc; color: #fff; font-weight: 600; }}
+        tr:hover {{ background: #f9fbfd; }}
+        .price {{ font-weight: bold; color: #2e7d32; }}
+        .badge {{ background: #e0e0e0; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }}
+    </style>
+</head>
+<body>
+    <h1>Fare Watch: Business Class Deals</h1>
+    <div class="meta">Last Scanned: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} | Route: NCL &#8594; SFO / LAX &#8594; NCL</div>
+    <table>
+        <thead>
+            <tr>
+                <th>Airline</th>
+                <th>Outbound (NCL-SFO)</th>
+                <th>Return (LAX-NCL)</th>
+                <th>Stops (Out / Return)</th>
+                <th>Combined Total</th>
+            </tr>
+        </thead>
+        <tbody>
+"""
+
+    for row in rows:
+        out_date, in_date, airline, code, price, currency, out_stops, in_stops = (
+            row
+        )
+        html_content += f"""
+            <tr>
+                <td><strong>{airline}</strong> <span class="badge">{code}</span></td>
+                <td>{out_date}</td>
+                <td>{in_date}</td>
+                <td>{out_stops} stop(s) / {in_stops} stop(s)</td>
+                <td class="price">{currency} {price:,.2f}</td>
+            </tr>"""
+
+    html_content += """
+        </tbody>
+    </table>
+</body>
+</html>"""
+
+    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"Successfully generated {OUTPUT_HTML}")
+
+
 if __name__ == "__main__":
     init_db()
-    print("Starting One-Way Leg Scan for Open-Jaw Route (July & August 2027)...")
+    print("Starting one-way leg scan for open-jaw route...")
 
     start_date = datetime.strptime("2027-07-01", "%Y-%m-%d")
     end_date = datetime.strptime("2027-08-31", "%Y-%m-%d")
@@ -179,18 +253,16 @@ if __name__ == "__main__":
         outbound_date = current_dep.strftime("%Y-%m-%d")
         return_date = (current_dep + timedelta(days=14)).strftime("%Y-%m-%d")
 
-        # 1. Fetch Outbound Leg (NCL -> SFO)
+        # Fetch individual legs
         fetch_one_way_leg(
-            "NCL", "SFO", outbound_date, leg_type="outbound", top_limit=100
+            "NCL", "SFO", outbound_date, leg_type="outbound", top_limit=50
         )
-        time.sleep(0.5)
-
-        # 2. Fetch Return Leg (LAX -> NCL)
+        time.sleep(0.3)
         fetch_one_way_leg(
-            "LAX", "NCL", return_date, leg_type="return", top_limit=100
+            "LAX", "NCL", return_date, leg_type="return", top_limit=50
         )
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         current_dep += timedelta(days=3)
 
-    print("Individual leg scan complete.")
+    generate_html_report()
