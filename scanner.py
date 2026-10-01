@@ -1,3 +1,4 @@
+
 import datetime
 import os
 import sqlite3
@@ -28,7 +29,7 @@ db_path = config["settings"].get("database", "farewatch.db")
 conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
 
-# Ensure target tables exist
+# Core Tables
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS routes (
@@ -51,26 +52,48 @@ CREATE TABLE IF NOT EXISTS scans (
 """
 )
 
+# Legacy compatibility table required by analyse.py
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    route_name TEXT,
+    origin TEXT,
+    destination TEXT,
+    depart_date TEXT,
+    days_out INTEGER,
+    status TEXT DEFAULT 'ok'
+)
+"""
+)
+
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS offers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     scan_id INTEGER,
+    search_id INTEGER,
     route_id INTEGER,
     airline TEXT,
+    airline_code TEXT,
+    airline_name TEXT,
     total_amount REAL,
     currency TEXT,
     total_amount_gbp REAL,
     outbound_date TEXT,
     return_date TEXT,
     transfers INTEGER,
+    booking_class TEXT DEFAULT 'business',
+    stops_out INTEGER DEFAULT 0,
+    all_business INTEGER DEFAULT 1,
     FOREIGN KEY(scan_id) REFERENCES scans(id),
     FOREIGN KEY(route_id) REFERENCES routes(id)
 )
 """
 )
 
-# Create/Update Unified View for Easy DB Reading
+# Unified View
 cursor.execute(
     """
 CREATE VIEW IF NOT EXISTS v_full_fare_history AS
@@ -99,37 +122,37 @@ cursor.execute("INSERT INTO scans DEFAULT VALUES")
 scan_id = cursor.lastrowid
 conn.commit()
 
-# --- Date Range Generator (July & August) ---
+# --- Date Range Generator (July & August 2027) ---
 search_months = config["settings"].get("search_months", ["2027-07", "2027-08"])
 departure_dates = []
 
 for month_str in search_months:
     year, month = map(int, month_str.split("-"))
-    # Start from beginning of month or tomorrow if scanning current month
     start_day = 1
     today = datetime.date.today()
     if year == today.year and month == today.month:
         start_day = today.day + 1
 
-    # Get number of days in target month
     if month == 12:
         next_month = datetime.date(year + 1, 1, 1)
     else:
         next_month = datetime.date(year, month + 1, 1)
     last_day = (next_month - datetime.timedelta(days=1)).day
 
-    for day in range(start_day, last_day + 1, 2):  # Scan every 2 days to manage API rate limits
+    for day in range(
+        start_day, last_day + 1, 2
+    ):  # Scan every 2 days for API rate optimization
         departure_dates.append(datetime.date(year, month, day))
 
 stay_days = config["settings"].get("return_stay_days", 14)
 max_connections = config["settings"].get("max_connections", 1)
 fx_rates = config.get("fx_to_gbp", {"GBP": 1.0, "USD": 0.78, "EUR": 0.85})
 
-# --- Execute Scans ---
-print(f"Starting Scan ID {scan_id} for {len(departure_dates)} target departure windows...")
+print(
+    f"Starting Scan ID {scan_id} for {len(departure_dates)} target departure windows..."
+)
 
 for route in config["routes"]:
-    # Upsert route entry
     cursor.execute(
         """
         INSERT INTO routes (name, origin, destination, return_origin, return_destination)
@@ -163,12 +186,23 @@ for route in config["routes"]:
 
         print(f"Searching {route['name']}: {dep_str} to {ret_str}...")
 
+        # Create entry in legacy searches table for analyse.py compatibility
+        cursor.execute(
+            """
+            INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
+            VALUES (?, ?, ?, ?, ?, 'ok')
+        """,
+            (route["name"], route["origin"], route["destination"], dep_str, 0),
+        )
+        search_id = cursor.lastrowid
+
         try:
             # Send Open-Jaw Business Class Request to Duffel API
+            # NOTE: Using plural 'passengers' fixes the 'OfferRequestCreate' error
             offer_request = (
                 duffel.offer_requests.create()
-                .passenger([{"type": "adult"}])
-                .cabin_class(config["settings"]["cabins"][0])
+                .passengers([{"type": "adult"}])
+                .cabin_class("business")
                 .slices(
                     [
                         {
@@ -186,11 +220,9 @@ for route in config["routes"]:
                 .execute()
             )
 
-            # Retrieve generated offers
             offers = duffel.offers.list(offer_request.id)
 
             for offer in offers:
-                # Calculate maximum transfers/connections across both legs
                 max_transfers = 0
                 for s in offer.slices:
                     num_segments = len(s.segments)
@@ -198,7 +230,6 @@ for route in config["routes"]:
                     if transfers > max_transfers:
                         max_transfers = transfers
 
-                # Enforce max connection constraint
                 if max_transfers > max_connections:
                     continue
 
@@ -206,18 +237,23 @@ for route in config["routes"]:
                 currency = offer.total_currency
                 gbp_rate = fx_rates.get(currency, 1.0)
                 amount_gbp = round(amount * gbp_rate, 2)
-                airline = offer.owner.name
+                airline_name = offer.owner.name
+                airline_code = getattr(offer.owner, "iata_code", "XX")
 
                 cursor.execute(
                     """
                     INSERT INTO offers 
-                    (scan_id, route_id, airline, total_amount, currency, total_amount_gbp, outbound_date, return_date, transfers)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (scan_id, search_id, route_id, airline, airline_code, airline_name, 
+                     total_amount, currency, total_amount_gbp, outbound_date, return_date, transfers, booking_class)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'business')
                 """,
                     (
                         scan_id,
+                        search_id,
                         route_id,
-                        airline,
+                        airline_name,
+                        airline_code,
+                        airline_name,
                         amount,
                         currency,
                         amount_gbp,
@@ -228,7 +264,7 @@ for route in config["routes"]:
                 )
 
             conn.commit()
-            time.sleep(0.5)  # Respect API rate limits
+            time.sleep(0.5)
 
         except Exception as e:
             print(f"Error scanning {dep_str}: {str(e)}")
