@@ -27,7 +27,8 @@ def init_db():
             destination TEXT,
             depart_date TEXT,
             days_out INTEGER,
-            status TEXT
+            status TEXT,
+            offer_count INTEGER DEFAULT 0
         )
     """
     )
@@ -56,7 +57,14 @@ def init_db():
 # ---------------------------------------------------------------------------
 # Duffel API Scanner (Open-Jaw Business Class)
 # ---------------------------------------------------------------------------
-def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_date="", return_date="", route_name="NCL-SFO/LAX-NCL"):
+def scan_window(
+    origin="NCL",
+    outbound_dest="SFO",
+    return_orig="LAX",
+    depart_date="",
+    return_date="",
+    route_name="NCL-SFO/LAX-NCL",
+):
     """Queries Duffel for Open-Jaw Business Class flight offers (NCL->SFO, LAX->NCL)."""
     url = "https://api.duffel.com/air/offer_requests"
 
@@ -70,8 +78,16 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
     payload = {
         "data": {
             "slices": [
-                {"origin": origin, "destination": outbound_dest, "departure_date": depart_date},
-                {"origin": return_orig, "destination": origin, "departure_date": return_date},
+                {
+                    "origin": origin,
+                    "destination": outbound_dest,
+                    "departure_date": depart_date,
+                },
+                {
+                    "origin": return_orig,
+                    "destination": origin,
+                    "departure_date": return_date,
+                },
             ],
             "passengers": [{"type": "adult"}],
             "cabin_class": "business",
@@ -93,26 +109,46 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
 
             cursor.execute(
                 """
-                INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status, offer_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (now_str, route_name, origin, outbound_dest, depart_date, 14, "error"),
+                (
+                    now_str,
+                    route_name,
+                    origin,
+                    outbound_dest,
+                    depart_date,
+                    14,
+                    "error",
+                    0,
+                ),
             )
             conn.commit()
             return
 
-        # Insert search log entry with explicit scanned_at timestamp
+        offers = data.get("data", {}).get("offers", [])
+        num_offers = len(offers)
+
+        # Insert search log entry with offer_count and scanned_at timestamp
         cursor.execute(
             """
-            INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status, offer_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (now_str, route_name, origin, outbound_dest, depart_date, 14, "ok"),
+            (
+                now_str,
+                route_name,
+                origin,
+                outbound_dest,
+                depart_date,
+                14,
+                "ok",
+                num_offers,
+            ),
         )
         search_id = cursor.lastrowid
 
         # Parse and save flight offers
-        offers = data.get("data", {}).get("offers", [])
         for offer in offers:
             owner = offer.get("owner", {})
             airline_code = owner.get("iata_code", "XX")
@@ -121,7 +157,9 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
             currency = offer.get("total_currency", "GBP")
 
             # Count total stops on outward leg
-            outbound_slices = offer.get("slices", [])[0] if offer.get("slices") else {}
+            outbound_slices = (
+                offer.get("slices", [])[0] if offer.get("slices") else {}
+            )
             segments = outbound_slices.get("segments", [])
             stops_out = max(0, len(segments) - 1)
 
@@ -145,7 +183,9 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
             )
 
         conn.commit()
-        print(f"Successfully scanned NCL->SFO ({depart_date}) & LAX->NCL ({return_date}): Found {len(offers)} Business offers")
+        print(
+            f"Successfully scanned NCL->SFO ({depart_date}) & LAX->NCL ({return_date}): Found {num_offers} Business offers"
+        )
 
     except Exception as e:
         print(f"Error scanning {depart_date}: {e}")
@@ -158,7 +198,9 @@ def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_dat
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     init_db()
-    print("Starting Open-Jaw Business Class Scan (NCL -> SFO / LAX -> NCL) for July & August 2027...")
+    print(
+        "Starting Open-Jaw Business Class Scan (NCL -> SFO / LAX -> NCL) for July & August 2027..."
+    )
 
     start_date = datetime.strptime("2027-07-01", "%Y-%m-%d")
     end_date = datetime.strptime("2027-08-31", "%Y-%m-%d")
@@ -168,7 +210,13 @@ if __name__ == "__main__":
         dep = current_dep.strftime("%Y-%m-%d")
         ret = (current_dep + timedelta(days=14)).strftime("%Y-%m-%d")
 
-        scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_date=dep, return_date=ret)
+        scan_window(
+            origin="NCL",
+            outbound_dest="SFO",
+            return_orig="LAX",
+            depart_date=dep,
+            return_date=ret,
+        )
 
         current_dep += timedelta(days=3)  # Advances by 3 days per search window
         time.sleep(1)  # Rate limiting safety delay
