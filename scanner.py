@@ -8,7 +8,7 @@ import requests
 # Configuration & Database Setup
 # ---------------------------------------------------------------------------
 DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY", "duffel_test_YOUR_API_KEY")
-DB_PATH = "farewatch.db"
+DB_PATH = "fares.db"
 
 
 def init_db():
@@ -53,10 +53,10 @@ def init_db():
 
 
 # ---------------------------------------------------------------------------
-# Duffel API Scanner (Business Class)
+# Duffel API Scanner (Open-Jaw Business Class)
 # ---------------------------------------------------------------------------
-def scan_window(origin, destination, depart_date, return_date, route_name="NCL-US"):
-    """Queries Duffel for Business Class flight offers using the active v2 API version."""
+def scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_date="", return_date="", route_name="NCL-SFO/LAX-NCL"):
+    """Queries Duffel for Open-Jaw Business Class flight offers (NCL->SFO, LAX->NCL)."""
     url = "https://api.duffel.com/air/offer_requests"
 
     headers = {
@@ -66,14 +66,15 @@ def scan_window(origin, destination, depart_date, return_date, route_name="NCL-U
         "Content-Type": "application/json",
     }
 
+    # Open-jaw payload: NCL -> SFO and LAX -> NCL
     payload = {
         "data": {
             "slices": [
-                {"origin": origin, "destination": destination, "departure_date": depart_date},
-                {"origin": "LAX", "destination": origin, "departure_date": return_date},
+                {"origin": origin, "destination": outbound_dest, "departure_date": depart_date},
+                {"origin": return_orig, "destination": origin, "departure_date": return_date},
             ],
             "passengers": [{"type": "adult"}],
-            "cabin_class": "business",  # UPDATE 1: Set cabin search to Business Class
+            "cabin_class": "business",
         }
     }
 
@@ -84,17 +85,17 @@ def scan_window(origin, destination, depart_date, return_date, route_name="NCL-U
         response = requests.post(url, json=payload, headers=headers, timeout=30)
         data = response.json()
 
-        if response.status_code != 200 and response.status_code != 201:
+        if response.status_code not in (200, 201):
             error_type = data.get("errors", [{}])[0].get("type", "unknown_error")
             error_msg = data.get("errors", [{}])[0].get("message", "Request failed")
-            print(f"Error scanning {depart_date}: {error_type}: {error_msg}")
+            print(f"Error scanning {depart_date}: {error_type} - {error_msg}")
 
             cursor.execute(
                 """
                 INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
                 VALUES (?, ?, ?, ?, ?, ?)
             """,
-                (route_name, origin, destination, depart_date, 14, "error"),
+                (route_name, origin, outbound_dest, depart_date, 14, "error"),
             )
             conn.commit()
             return
@@ -105,7 +106,7 @@ def scan_window(origin, destination, depart_date, return_date, route_name="NCL-U
             INSERT INTO searches (route_name, origin, destination, depart_date, days_out, status)
             VALUES (?, ?, ?, ?, ?, ?)
         """,
-            (route_name, origin, destination, depart_date, 14, "ok"),
+            (route_name, origin, outbound_dest, depart_date, 14, "ok"),
         )
         search_id = cursor.lastrowid
 
@@ -136,14 +137,14 @@ def scan_window(origin, destination, depart_date, return_date, route_name="NCL-U
                     airline_name,
                     total_amount,
                     currency,
-                    "business",  # UPDATE 2: Store booking class as business
+                    "business",
                     stops_out,
-                    1,           # UPDATE 3: Flag all_business as 1 (True)
+                    1,
                 ),
             )
 
         conn.commit()
-        print(f"Successfully scanned {depart_date}: Found {len(offers)} Business class offers")
+        print(f"Successfully scanned NCL->SFO ({depart_date}) & LAX->NCL ({return_date}): Found {len(offers)} Business offers")
 
     except Exception as e:
         print(f"Error scanning {depart_date}: {e}")
@@ -152,18 +153,23 @@ def scan_window(origin, destination, depart_date, return_date, route_name="NCL-U
 
 
 # ---------------------------------------------------------------------------
-# Main Execution Entry
+# Main Execution Loop (July & August 2027)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     init_db()
-    print("Starting Business Class Scan...")
+    print("Starting Open-Jaw Business Class Scan (NCL -> SFO / LAX -> NCL) for July & August 2027...")
 
     start_date = datetime.strptime("2027-07-01", "%Y-%m-%d")
-    for i in range(5):  # Adjust range for desired number of windows
-        dep = (start_date + timedelta(days=i * 2)).strftime("%Y-%m-%d")
-        ret = (start_date + timedelta(days=i * 2 + 14)).strftime("%Y-%m-%d")
-        print(f"Searching Newcastle to San Francisco / Los Angeles to Newcastle (Business): {dep} to {ret}...")
-        scan_window("NCL", "SFO", dep, ret)
-        time.sleep(1)
+    end_date = datetime.strptime("2027-08-31", "%Y-%m-%d")
 
-    print("Business class scan completed successfully. Results logged to farewatch.db.")
+    current_dep = start_date
+    while current_dep <= end_date:
+        dep = current_dep.strftime("%Y-%m-%d")
+        ret = (current_dep + timedelta(days=14)).strftime("%Y-%m-%d")
+
+        scan_window(origin="NCL", outbound_dest="SFO", return_orig="LAX", depart_date=dep, return_date=ret)
+
+        current_dep += timedelta(days=3)  # Advances by 3 days per search window
+        time.sleep(1)  # Rate limiting safety delay
+
+    print("Business class scan completed successfully. Results saved to fares.db.")
