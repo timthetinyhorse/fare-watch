@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 import time
@@ -64,8 +63,9 @@ def scan_window(
     depart_date="",
     return_date="",
     route_name="NCL-SFO/LAX-NCL",
+    top_limit=250,
 ):
-    """Queries Duffel for Open-Jaw Business Class flight offers (NCL->SFO, LAX->NCL)."""
+    """Queries Duffel for Open-Jaw Business Class flight offers and saves top N cheapest."""
     url = "https://api.duffel.com/air/offer_requests"
 
     headers = {
@@ -127,9 +127,14 @@ def scan_window(
             return
 
         offers = data.get("data", {}).get("offers", [])
-        num_offers = len(offers)
+        total_found = len(offers)
 
-        # Insert search log entry with offer_count and scanned_at timestamp
+        # Sort all offers by price ascending and slice the top N cheapest
+        sorted_offers = sorted(
+            offers, key=lambda x: float(x.get("total_amount", float("inf")))
+        )[:top_limit]
+
+        # Insert search log entry recording the count stored
         cursor.execute(
             """
             INSERT INTO searches (scanned_at, route_name, origin, destination, depart_date, days_out, status, offer_count)
@@ -143,20 +148,19 @@ def scan_window(
                 depart_date,
                 14,
                 "ok",
-                num_offers,
+                len(sorted_offers),
             ),
         )
         search_id = cursor.lastrowid
 
-        # Parse and save flight offers
-        for offer in offers:
+        # Save top 250 lowest offers
+        for offer in sorted_offers:
             owner = offer.get("owner", {})
             airline_code = owner.get("iata_code", "XX")
             airline_name = owner.get("name", "Unknown Airline")
             total_amount = float(offer.get("total_amount", 0.0))
             currency = offer.get("total_currency", "GBP")
 
-            # Count total stops on outward leg
             outbound_slices = (
                 offer.get("slices", [])[0] if offer.get("slices") else {}
             )
@@ -184,7 +188,7 @@ def scan_window(
 
         conn.commit()
         print(
-            f"Successfully scanned NCL->SFO ({depart_date}) & LAX->NCL ({return_date}): Found {num_offers} Business offers"
+            f"Scanned NCL->SFO ({depart_date}) & LAX->NCL ({return_date}): Total found {total_found}, saved top {len(sorted_offers)} cheapest"
         )
 
     except Exception as e:
@@ -216,9 +220,10 @@ if __name__ == "__main__":
             return_orig="LAX",
             depart_date=dep,
             return_date=ret,
+            top_limit=250,
         )
 
-        current_dep += timedelta(days=3)  # Advances by 3 days per search window
-        time.sleep(1)  # Rate limiting safety delay
+        current_dep += timedelta(days=3)
+        time.sleep(1)
 
     print("Business class scan completed successfully. Results saved to fares.db.")
